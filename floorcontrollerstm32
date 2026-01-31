@@ -1,0 +1,1040 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include <string.h>
+#include <stdio.h>
+#include "LiquidCrystal_I2C_STM32.h"
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+#define KEY_UP_RAW()   (HAL_GPIO_ReadPin(UP_KEY_GPIO_Port,  UP_KEY_Pin)  == GPIO_PIN_RESET)
+#define KEY_DN_RAW()   (HAL_GPIO_ReadPin(DN_KEY_GPIO_Port,  DN_KEY_Pin)  == GPIO_PIN_RESET)
+#define KEY_SFT_RAW()  (HAL_GPIO_ReadPin(SFT_KEY_GPIO_Port, SFT_KEY_Pin) == GPIO_PIN_RESET)
+#define KEY_ENT_RAW()  (HAL_GPIO_ReadPin(ENT_KEY_GPIO_Port, ENT_KEY_Pin) == GPIO_PIN_RESET)
+#define K_RLS   0x00
+#define K_INC   0x02    // UP
+#define K_DEC   0x04    // DOWN
+#define K_ESC   0x06    // SHIFT
+#define K_ENT   0x08    // ENTER
+
+#define ZONE_MAX_SENSORS 100
+#define ZONE_RESP_MAX   32
+#define MASTER_RX_MAX   64
+//for memory
+#define EEPROM_ADDR 0x50
+#define CONFIG_EEPROM_ADDR 0x0000
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c3;
+
+UART_HandleTypeDef huart4;
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+union{
+    struct{
+       unsigned Wait4KRLS:1;
+       unsigned Flg_RESET4:1;
+    }Flag;
+    unsigned char Flags;
+}KEY;
+
+// my menu items
+const char* MainMenu[] = {
+    "Floor ID",
+    "Total Zones",
+    "Display ID",
+    "Display Color",
+    "Display Arrow",
+    "Save and Exit"
+};
+
+// for zone response
+typedef struct
+{
+    uint8_t zone_id;
+    uint8_t total_sensors;
+    uint8_t sensors[ZONE_MAX_SENSORS];
+
+    uint8_t total_vacant;
+    uint8_t total_engaged;
+    uint8_t total_faulty;
+    uint8_t total_nocomm;
+
+    uint8_t valid;
+} ZoneData_t;
+
+
+ZoneData_t Zones[8];
+
+typedef struct {
+    uint32_t FloorID;
+    uint32_t TotalZones;
+    uint32_t DisplayID;
+    uint8_t DisplayColor;
+    uint8_t DisplayArrow;
+} Config_t;
+
+uint8_t menuCount = sizeof(MainMenu)/sizeof(MainMenu[0]);
+
+// current values
+uint32_t FloorID = 1;
+uint32_t TotalZones = 3;
+uint32_t DisplayID = 1;
+
+// display selections
+const char* DisplayColors[] = { "RED", "GREEN", "BLUE"};
+uint8_t colorCount = sizeof(DisplayColors)/sizeof(DisplayColors[0]);
+uint8_t DisplayColor = 0;
+
+// display arrows
+const char* DisplayArrows[] = { "UP", "DOWN", "LEFT", "RIGHT"};
+uint8_t arrowCount = sizeof(DisplayArrows)/sizeof(DisplayArrows[0]);
+uint8_t DisplayArrow = 0;
+
+// Password
+#define PASSWORD_LEN 6
+const char* PASSWORD = "123456";
+
+char keystt=0;
+
+int cursorPos;    // 0 ... (lcd_rows - 1)
+int selected;     // topIndex + cursorPos
+unsigned char prevKey = K_RLS;
+
+char flg=0;
+uint8_t DIS[10];
+uint32_t last_update = 0;
+Config_t Config;
+/* Zone data structure */
+uint8_t TS = 0;  // Total Sensors
+uint8_t TO = 0;  // Total Occupied
+uint8_t TV = 0;  // Total Vacant
+uint8_t TE = 0;  // Total Engaged
+uint8_t NC = 0;  // No Communication
+
+uint8_t master_rx[MASTER_RX_MAX];
+uint8_t master_rx_idx = 0;
+uint8_t master_rx_byte;
+
+/* Statistics structure */
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_I2C3_Init(void);
+static void MX_UART4_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART2_UART_Init(void);
+/* USER CODE BEGIN PFP */
+
+// --- Function prototypes ---
+unsigned char ReadKeyStt(void);
+unsigned char ReadKey(unsigned char LastState);
+uint32_t SetV(uint32_t value, uint8_t digits, uint8_t dec_pos, LiquidCrystal_I2C &lcd);
+void LCD_ShowDigits(LiquidCrystal_I2C &lcd, uint8_t *d, uint8_t blink, uint8_t dec_pos);
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+HAL_StatusTypeDef EEPROM_Write(uint16_t memAddress, uint8_t *data, uint16_t len) {
+    return HAL_I2C_Mem_Write(&hi2c1, (EEPROM_ADDR << 1), memAddress,
+                             I2C_MEMADD_SIZE_16BIT, data, len, HAL_MAX_DELAY);
+}
+
+HAL_StatusTypeDef EEPROM_Read(uint16_t memAddress, uint8_t *data, uint16_t len) {
+    return HAL_I2C_Mem_Read(&hi2c1, (EEPROM_ADDR << 1), memAddress,
+                            I2C_MEMADD_SIZE_16BIT, data, len, HAL_MAX_DELAY);
+}
+
+void Config_Save(void) {
+    EEPROM_Write(CONFIG_EEPROM_ADDR, (uint8_t*)&Config, sizeof(Config));
+    HAL_Delay(5); // EEPROM write delay (~5ms for page)
+}
+
+void Config_Load(void) {
+    EEPROM_Read(CONFIG_EEPROM_ADDR, (uint8_t*)&Config, sizeof(Config));
+
+    // sanity check (optional)
+    if(Config.TotalZones == 0xFFFFFFFF) { // uninitialized
+        Config.FloorID = 1;
+        Config.TotalZones = 3;
+        Config.DisplayID = 1;
+        Config.DisplayColor = 0;
+        Config.DisplayArrow = 0;
+        Config_Save();
+    }
+}
+
+LiquidCrystal_I2C lcd(&hi2c1, 0x27, 20, 4);
+#define US_TO_CYC(us) ((us) * (SystemCoreClock / 1000000))
+#define DWT_NOW()     (DWT->CYCCNT)
+#define DWT_ELAPSED(start) (DWT->CYCCNT - (start))
+
+void DWT_Init(void)
+{
+    // Enable TRC
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    // Reset the cycle counter
+    DWT->CYCCNT = 0;
+    // Enable the cycle counter
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+void Zone_SendRequest(uint8_t zone_id)
+{
+    uint8_t pkt[7] = {0xAA,zone_id,0x80,0xA1,0x00,0x00,0x55};
+    HAL_UART_Transmit(&huart2, pkt, sizeof(pkt), 100);
+}
+
+uint8_t Zone_ReadResponse(ZoneData_t *z, uint32_t timeout_ms)
+{
+    uint8_t rx[ZONE_RESP_MAX];
+    uint32_t tick = HAL_GetTick();
+    uint8_t idx = 0;
+
+    while(HAL_GetTick() - tick < timeout_ms)
+    {
+        if(HAL_UART_Receive(&huart2, &rx[idx], 1, 10) == HAL_OK)
+        {
+            if(rx[idx] == 0x55) break;
+            idx++;
+        }
+    }
+
+    if(idx < 10 || rx[0] != 0xAA) return 0;
+
+    z->zone_id       = rx[1];
+    z->total_sensors = rx[2];
+
+    uint8_t p = 3;
+    for(uint8_t i=0;i<z->total_sensors;i++)
+        z->sensors[i] = rx[p++];
+
+    z->total_vacant  = rx[p++];
+    z->total_engaged = rx[p++];
+    z->total_faulty  = rx[p++];
+    z->total_nocomm  = rx[p++];
+
+    z->valid = 1;
+    return 1;
+}
+
+void Floor_PollZones(void)
+{
+    memset(Zones, 0, sizeof(Zones));
+
+    for(uint8_t z = 0; z < Config.TotalZones; z++)
+    {
+        Zone_SendRequest(z + 1);
+
+        if(!Zone_ReadResponse(&Zones[z], 200))
+        {
+            Zones[z].zone_id = z + 1;
+            Zones[z].valid = 0;
+            Zones[z].total_nocomm = 1;
+        }
+
+        HAL_Delay(20);
+    }
+}
+
+uint16_t Floor_BuildResponse(uint8_t *out)
+{
+    uint16_t i = 0;
+
+    uint8_t floor_v = 0, floor_e = 0, floor_f = 0, floor_nc = 0;
+
+    out[i++] = 0xDE;
+    out[i++] = Config.FloorID;
+    out[i++] = Config.TotalZones;
+
+    for(uint8_t z=0; z<Config.TotalZones; z++)
+    {
+        ZoneData_t *zd = &Zones[z];
+
+        out[i++] = 0xAA;
+        out[i++] = zd->zone_id;
+        out[i++] = zd->total_sensors;
+
+        for(uint8_t s=0;s<zd->total_sensors;s++)
+            out[i++] = zd->sensors[s];
+
+        out[i++] = zd->total_vacant;
+        out[i++] = zd->total_engaged;
+        out[i++] = zd->total_faulty;
+        out[i++] = zd->total_nocomm;
+        out[i++] = 0x55;
+
+        floor_v  += zd->total_vacant;
+        floor_e  += zd->total_engaged;
+        floor_f  += zd->total_faulty;
+        floor_nc += zd->total_nocomm;
+    }
+
+    out[i++] = floor_v;
+    out[i++] = floor_e;
+    out[i++] = floor_f;
+    out[i++] = floor_nc;
+    out[i++] = 0xE9;
+
+    return i;
+}
+
+void Master_ProcessRequest(uint8_t *rx)
+{
+    if(rx[0] != 0xDE || rx[2] != 0x80) return;
+
+    if(rx[1] != Config.FloorID) return;
+
+    Floor_PollZones();
+
+    uint8_t tx[256];
+    uint16_t len = Floor_BuildResponse(tx);
+
+    HAL_UART_Transmit(&huart1, tx, len, 500);
+}
+
+//Verify password
+int EnterPassword(LiquidCrystal_I2C &lcd)
+{
+    uint8_t pwdDigits[PASSWORD_LEN] = {0,0,0,0,0,0}; // initial password: 000000
+    uint8_t blink = 0;
+
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("Password:");
+
+    while(1)
+    {
+        lcd.setCursor(0,1);
+        for(uint8_t i = 0; i < PASSWORD_LEN; i++)
+        {
+            lcd.write(pwdDigits[i] + '0');
+        }
+
+        lcd.setCursor(0,2);
+        for(uint8_t i = 0; i < PASSWORD_LEN; i++)
+        {
+            if(i == blink)
+                lcd.print("_");   // active digit
+            else
+                lcd.print(" ");   // empty space
+        }
+
+        // Wait for key press
+        unsigned char key;
+        do { key = ReadKey(keystt); } while(key == K_RLS);
+
+        switch(key)
+        {
+            case K_INC:
+                pwdDigits[blink] = (pwdDigits[blink] + 1) % 10;
+                break;
+
+            case K_DEC:
+                pwdDigits[blink] = (pwdDigits[blink] == 0) ? 9 : pwdDigits[blink]-1;
+                break;
+
+            case K_ESC: // move to next digit
+                blink = (blink + 1) % PASSWORD_LEN;
+                break;
+
+            case K_ENT: // confirm password
+            {
+                char entered[PASSWORD_LEN+1];
+                for(uint8_t i = 0; i < PASSWORD_LEN; i++)
+                    entered[i] = pwdDigits[i] + '0';
+                entered[PASSWORD_LEN] = '\0';
+
+                if(strcmp(entered, PASSWORD) == 0)
+                    return 1; // correct
+                else
+                    return 0; // wrong
+            }
+        }
+
+        // Wait for key release
+        do { keystt = ReadKey(keystt); } while(keystt != K_RLS);
+    }
+}
+
+void MenuEdit(LiquidCrystal_I2C &lcd)
+{
+    for(uint8_t i = 0; i < menuCount; i++)
+    {
+        lcd.clear();
+        lcd.setCursor(0,0);          // row 0: menu item
+        lcd.print(MainMenu[i]);
+
+        switch(i)
+        {
+        case 0:
+            Config.FloorID = SetV(Config.FloorID, 3, 0, lcd);
+            break;
+        case 1:
+            Config.TotalZones = SetV(Config.TotalZones, 2, 0, lcd);
+            break;
+        case 2:
+            Config.DisplayID = SetV(Config.DisplayID, 2, 0, lcd);
+            break;
+        case 3:
+            Config.DisplayColor = SetV(Config.DisplayColor, 1, 0, lcd);
+            break;
+        case 4:
+            Config.DisplayArrow = SetV(Config.DisplayArrow, 1, 0, lcd);
+            break;
+        case 5:
+            Config_Save();
+            lcd.clear();
+            lcd.setCursor(0,0);
+            lcd.print("Configuration Saved!");
+            HAL_Delay(1500);
+            break;
+
+        }
+    }
+}
+
+
+
+unsigned char ReadKeyStt(void)
+{
+    unsigned char RKey = K_RLS;
+
+    if(KEY_UP_RAW())      RKey = K_INC;
+    else if(KEY_DN_RAW()) RKey = K_DEC;
+    else if(KEY_SFT_RAW())RKey = K_ESC;
+    else if(KEY_ENT_RAW())RKey = K_ENT;
+
+    return RKey;
+}
+
+unsigned char ReadKey(unsigned char LastState)
+{
+    unsigned char Fkey, Skey;
+    unsigned char SttKey = LastState;
+
+    Fkey = ReadKeyStt();
+    HAL_Delay(1);              // debounce delay (same spirit as old code)
+    Skey = ReadKeyStt();
+
+    if(Fkey == Skey)
+    {
+        SttKey = Fkey;
+    }
+
+    return SttKey;
+}
+void keyprocess(void)
+{
+    keystt = ReadKey(keystt);
+
+    if(!KEY.Flag.Wait4KRLS)
+    {
+        switch(keystt)
+        {
+            case K_ESC:
+                KEY.Flag.Wait4KRLS = 1;   // wait for release
+                break;
+            case K_INC:
+                KEY.Flag.Wait4KRLS = 1;   // wait for release
+                break;
+            case K_DEC:
+                KEY.Flag.Wait4KRLS = 1;   // wait for release
+                break;
+            case K_ENT:
+                KEY.Flag.Wait4KRLS = 1;   // wait for release
+
+                break;
+
+            default:
+                break;
+        }
+    }
+    else
+    {
+        if(keystt == K_RLS)
+        {
+            KEY.Flag.Wait4KRLS = 0;       // released
+        }
+    }
+}
+static void ValueToDigits(uint32_t value, uint8_t *d)
+  {
+      value %= 1000000;
+      d[0] = value / 100000; value %= 100000;
+      d[1] = value / 10000;  value %= 10000;
+      d[2] = value / 1000;   value %= 1000;
+      d[3] = value / 100;    value %= 100;
+      d[4] = value / 10;
+      d[5] = value % 10;
+  }
+
+  static uint32_t DigitsToValue(uint8_t *d)
+  {
+      return  d[0]*100000UL +
+              d[1]*10000UL  +
+              d[2]*1000UL   +
+              d[3]*100UL    +
+              d[4]*10UL     +
+              d[5];
+  }
+
+  void LCD_ShowDigits(LiquidCrystal_I2C &lcd,
+                      uint8_t *d,
+                      uint8_t blink,
+                      uint8_t dec_pos)
+  {
+      const uint8_t start_col = 5;
+      uint8_t col = start_col;
+      uint8_t blink_col = start_col;
+
+      /* clear entire field */
+      lcd.setCursor(start_col, 2);
+      lcd.print("         ");   // enough for 6 digits + dot
+
+      lcd.setCursor(start_col, 2);
+
+      for(uint8_t i = 0; i < 6; i++)
+      {
+          /* save cursor position for blink digit */
+          if(i == blink)
+              blink_col = col;
+
+          /* print digit */
+          lcd.write((char)(d[i] + '0'));
+          col++;
+
+          /* print decimal point after correct digit */
+          if(dec_pos && ((5 - i) == dec_pos))
+          {
+              lcd.write('.');
+              col++;
+          }
+      }
+      /* place blinking cursor on correct digit */
+      lcd.setCursor(blink_col, 2);
+      lcd.cursor();
+      lcd.blink();
+  }
+
+
+uint32_t SetV(uint32_t value,uint8_t digits,uint8_t dec_pos,
+              LiquidCrystal_I2C &lcd)
+{
+
+
+    uint8_t blink_min = 6 - digits; // leftmost editable digit
+    uint8_t blink_max = 5;                    // rightmost editable digit
+    uint8_t blink     = blink_min;            // start at leftmost
+
+    ValueToDigits(value, DIS);
+//    lcd.clear();
+
+    while(1)
+    {
+        LCD_ShowDigits(lcd, DIS, blink, dec_pos);
+
+        /* wait for key press */
+        do { keystt = ReadKey(keystt); }
+        while(keystt == K_RLS);
+
+        switch(keystt)
+        {
+            case K_INC:
+                DIS[blink] = (DIS[blink] + 1) % 10;
+                break;
+
+            case K_DEC:
+                DIS[blink] = (DIS[blink] == 0) ? 9 : DIS[blink] - 1;
+                break;
+
+            case K_ESC:   // SHIFT → move LEFT to RIGHT
+                if(blink < blink_max)
+                    blink++;
+                else
+                    blink = blink_min;   // roll over
+                break;
+
+            case K_ENT:
+                lcd.noBlink();
+                lcd.noCursor();
+                return DigitsToValue(DIS);
+        }
+
+        /* wait for key release */
+        do { keystt = ReadKey(keystt); }
+        while(keystt != K_RLS);
+    }
+}
+
+
+
+void LCD_Show(uint8_t TS, uint8_t TO,uint8_t TV, uint8_t TE, uint8_t NC)
+{
+	char buf[32];
+    if (DWT_ELAPSED(last_update) > 1000)// 5000us = 5ms
+	  {
+		  if( flg==0)
+		  {
+			  lcd.clear();
+			  lcd.setCursor(0,0);
+			  lcd.print("   HOUSTON SYSTEM   ");
+			  lcd.setCursor(0,1);
+			  lcd.print("********************");
+			  flg=1;
+			  }
+	  }
+    // Line 3: Disengaged + Error
+    lcd.setCursor(0, 2);
+    snprintf(buf, sizeof(buf), "TS=%02d TO=%02d TV=%02d", TS, TO, TV);
+    lcd.print(buf);
+
+    // Line 4: Total + Engaged + NoComm
+    lcd.setCursor(0, 3);
+    snprintf(buf, sizeof(buf), "    TE=%02d  NC=%02d   ", TE, NC);
+    lcd.print(buf);
+
+}
+
+void LCD_ShowInitScreen(void)
+{
+
+    lcd.setCursor(0,0);
+    lcd.print("   HOUSTON SYSTEM   ");
+
+    lcd.setCursor(0,1);
+    lcd.print("********************");
+
+    lcd.setCursor(0,2);
+    lcd.print("PARKING GUIDANCE SYS");
+
+    lcd.setCursor(0,3);
+    lcd.print("INITIALIZING      "); // spaces important
+}
+void LCD_InitDots(uint8_t dots)
+{
+    lcd.setCursor(12, 3);   // after "INITIALIZING"
+    for(uint8_t i = 0; i < dots; i++)
+        lcd.print(".");
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_I2C3_Init();
+  MX_UART4_Init();
+  MX_USART1_UART_Init();
+  MX_USART2_UART_Init();
+
+  /* USER CODE BEGIN 2 */
+  HAL_UART_Receive_IT(&huart1, &master_rx_byte, 1);
+  DWT_Init();
+  lcd.begin(20, 4);
+  lcd.backlight();
+  lcd.clear();
+  LCD_ShowInitScreen();
+  Config_Load();
+  for(uint8_t i = 1; i <= 6; i++)
+    {
+        LCD_InitDots(i);
+  //      HAL_Delay(700);   // 👈 slow increase (adjust speed)
+    }
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+	  while(1)
+	  {
+	      LCD_Show(TS, TO, TV, TE, NC);
+	      unsigned char key = ReadKey(keystt);
+	      if(key == K_ENT)
+	      {
+	          lcd.clear();
+	          lcd.setCursor(0,0);
+	          lcd.print("Password Required");
+
+	          if(EnterPassword(lcd))
+	          {
+	              MenuEdit(lcd);
+	          }
+	          else
+	          {
+	              lcd.clear();
+	              lcd.setCursor(0,1);
+	              lcd.print("Wrong Password!");
+	              HAL_Delay(1500);
+	          }
+	      }
+
+	      HAL_Delay(100);
+	  }
+
+
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief I2C3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C3_Init(void)
+{
+
+  /* USER CODE BEGIN I2C3_Init 0 */
+
+  /* USER CODE END I2C3_Init 0 */
+
+  /* USER CODE BEGIN I2C3_Init 1 */
+
+  /* USER CODE END I2C3_Init 1 */
+  hi2c3.Instance = I2C3;
+  hi2c3.Init.ClockSpeed = 100000;
+  hi2c3.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c3.Init.OwnAddress1 = 0;
+  hi2c3.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c3.Init.OwnAddress2 = 0;
+  hi2c3.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c3.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C3_Init 2 */
+
+  /* USER CODE END I2C3_Init 2 */
+
+}
+
+/**
+  * @brief UART4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART4_Init(void)
+{
+
+  /* USER CODE BEGIN UART4_Init 0 */
+
+  /* USER CODE END UART4_Init 0 */
+
+  /* USER CODE BEGIN UART4_Init 1 */
+
+  /* USER CODE END UART4_Init 1 */
+  huart4.Instance = UART4;
+  huart4.Init.BaudRate = 115200;
+  huart4.Init.WordLength = UART_WORDLENGTH_8B;
+  huart4.Init.StopBits = UART_STOPBITS_1;
+  huart4.Init.Parity = UART_PARITY_NONE;
+  huart4.Init.Mode = UART_MODE_TX_RX;
+  huart4.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart4.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART4_Init 2 */
+
+  /* USER CODE END UART4_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+
+  /*Configure GPIO pins : DN_KEY_Pin UP_KEY_Pin ENT_KEY_Pin SFT_KEY_Pin */
+  GPIO_InitStruct.Pin = DN_KEY_Pin|UP_KEY_Pin|ENT_KEY_Pin|SFT_KEY_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* UART RX interrupt callback */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if(huart == &huart1)   // MASTER UART
+    {
+        uint8_t b = master_rx_byte;
+
+        if(master_rx_idx < MASTER_RX_MAX)
+            master_rx[master_rx_idx++] = b;
+
+        if(b == 0xE9)      // end of master frame
+        {
+            Master_ProcessRequest(master_rx);
+            master_rx_idx = 0;
+        }
+
+        /* Re-arm UART interrupt */
+        HAL_UART_Receive_IT(&huart1, &master_rx_byte, 1);
+    }
+}
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
